@@ -1,0 +1,8 @@
+{
+  "controller_url": "https://192.168.1.1",
+  "api_key": "YOUR_UNIFI_API_KEY",
+  "site": "default",
+  "rule_name": "Block TikTok",
+  "block_minutes": 5,
+  "server_port": 8091
+}
