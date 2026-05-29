@@ -4,5 +4,5 @@
   "site": "default",
   "rule_name": "Block TikTok",
   "block_minutes": 5,
-  "server_port": 8091
+  "server_port": 8092
 }

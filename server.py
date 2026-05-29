@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 bad_parents — TikTok block controller for UniFi Dream Machine
-Toggles a named Traffic Rule via the UniFi OS API.
+Uses the UniFi v2 API with X-API-KEY header auth (no 2FA required).
 """
 import json
 import os
@@ -14,10 +14,19 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 BASE = os.path.dirname(__file__)
 
+TIKTOK_DOMAINS = [
+    'tiktok.com',
+    'tiktokcdn.com',
+    'tiktokv.com',
+    'tiktokcdn-us.com',
+    'musically.com',
+    'byteoversea.com',
+]
+
 # ── State ─────────────────────────────────────────────────────────────────────
 state = {
     'blocked':    False,
-    'unblock_at': None,   # epoch seconds
+    'unblock_at': None,
     'error':      None,
 }
 _timer: threading.Timer | None = None
@@ -30,13 +39,13 @@ def cfg():
         return json.load(f)
 
 
-# ── UniFi API client (API-key / Bearer token auth — no 2FA required) ──────────
+# ── UniFi API client ──────────────────────────────────────────────────────────
 class UniFiClient:
     def __init__(self, base_url, api_key, site='default'):
-        self.base    = base_url.rstrip('/')
-        self.site    = site
-        self._key    = api_key
-        self._ctx    = ssl.create_default_context()
+        self.base = base_url.rstrip('/')
+        self.site = site
+        self._key = api_key
+        self._ctx = ssl.create_default_context()
         self._ctx.check_hostname = False
         self._ctx.verify_mode    = ssl.CERT_NONE
 
@@ -44,47 +53,77 @@ class UniFiClient:
         url  = self.base + path
         data = json.dumps(body).encode() if body is not None else None
         req  = urllib.request.Request(url, data=data, method=method, headers={
-            'Content-Type':  'application/json',
-            'Accept':        'application/json',
-            'Authorization': f'Bearer {self._key}',
-            'X-API-KEY':     self._key,   # some firmware versions use this header
+            'Content-Type': 'application/json',
+            'Accept':       'application/json',
+            'X-API-KEY':    self._key,
         })
-        ctx = self._ctx
-        with urllib.request.urlopen(req, context=ctx) as r:
+        with urllib.request.urlopen(req, context=self._ctx) as r:
             return json.loads(r.read())
 
-    def traffic_rules(self):
-        return self._req('GET', f'/proxy/network/v2/api/site/{self.site}/trafficrules')
+    def list_rules(self):
+        return self._req('GET',
+            f'/proxy/network/v2/api/site/{self.site}/trafficrules')
 
-    def set_rule_enabled(self, rule, enabled: bool):
-        rule = dict(rule)
-        rule['enabled'] = enabled
+    def create_rule(self, rule):
+        return self._req('POST',
+            f'/proxy/network/v2/api/site/{self.site}/trafficrules', rule)
+
+    def update_rule(self, rule_id, rule):
         return self._req('PUT',
-            f'/proxy/network/v2/api/site/{self.site}/trafficrules/{rule["_id"]}',
-            rule)
+            f'/proxy/network/v2/api/site/{self.site}/trafficrules/{rule_id}', rule)
+
+    def find_rule(self, name):
+        for r in self.list_rules():
+            if r.get('description', '').lower() == name.lower():
+                return r
+        return None
+
+    def ensure_rule(self, name):
+        """Return existing rule or create it if absent."""
+        rule = self.find_rule(name)
+        if rule:
+            return rule
+        created = self.create_rule({
+            'action':          'BLOCK',
+            'description':     name,
+            'enabled':         False,
+            'ip_version':      'BOTH',
+            'matching_target': 'DOMAIN',
+            'target_devices':  [{'type': 'ALL_CLIENTS'}],
+            'schedule':        {'mode': 'ALWAYS'},
+            'app_category_ids': [], 'app_ids': [],
+            'ip_addresses': [], 'ip_ranges': [],
+            'network_ids': [], 'regions': [],
+            'bandwidth_limit': {'enabled': False,
+                                'download_limit_kbps': 1024,
+                                'upload_limit_kbps': 1024},
+            'domains': [
+                {'domain': d, 'port_ranges': [], 'ports': []}
+                for d in TIKTOK_DOMAINS
+            ],
+        })
+        return created
+
+    def set_enabled(self, rule, enabled: bool):
+        r = dict(rule)
+        r['enabled'] = enabled
+        return self.update_rule(r['_id'], r)
 
 
-def find_rule(client, name):
-    rules = client.traffic_rules()
-    for r in (rules if isinstance(rules, list) else rules.get('data', [])):
-        if r.get('description', '').lower() == name.lower():
-            return r
-    return None
+# ── Block / unblock ───────────────────────────────────────────────────────────
+def _make_client():
+    c = cfg()
+    return UniFiClient(c['controller_url'], c['api_key'], c.get('site', 'default'))
 
 
-# ── Block / unblock logic ─────────────────────────────────────────────────────
 def _do_unblock():
     with _lock:
         try:
-            c = cfg()
-            client = UniFiClient(c['controller_url'], c['api_key'],
-                                 c.get('site', 'default'))
-            rule = find_rule(client, c['rule_name'])
+            client = _make_client()
+            rule   = client.find_rule(cfg()['rule_name'])
             if rule:
-                client.set_rule_enabled(rule, False)
-            state['blocked']    = False
-            state['unblock_at'] = None
-            state['error']      = None
+                client.set_enabled(rule, False)
+            state.update(blocked=False, unblock_at=None, error=None)
         except Exception as e:
             state['error'] = str(e)
 
@@ -93,21 +132,12 @@ def block_tiktok():
     global _timer
     with _lock:
         try:
-            c = cfg()
-            client = UniFiClient(c['controller_url'], c['api_key'],
-                                 c.get('site', 'default'))
-            rule = find_rule(client, c['rule_name'])
-            if not rule:
-                state['error'] = (
-                    f"No Traffic Rule named \"{c['rule_name']}\" found. "
-                    "Create it in UniFi → Traffic Rules first."
-                )
-                return
-            client.set_rule_enabled(rule, True)
+            c      = cfg()
+            client = _make_client()
+            rule   = client.ensure_rule(c['rule_name'])
+            client.set_enabled(rule, True)
             duration = int(c.get('block_minutes', 5)) * 60
-            state['blocked']    = True
-            state['unblock_at'] = time.time() + duration
-            state['error']      = None
+            state.update(blocked=True, unblock_at=time.time() + duration, error=None)
             if _timer:
                 _timer.cancel()
             _timer = threading.Timer(duration, _do_unblock)
@@ -132,39 +162,35 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/':
             self._file('index.html', 'text/html; charset=utf-8')
+
         elif self.path == '/api/status':
             c = cfg()
             self._json({
-                'blocked':      state['blocked'],
-                'unblock_at':   state['unblock_at'],
-                'error':        state['error'],
+                'blocked':       state['blocked'],
+                'unblock_at':    state['unblock_at'],
+                'error':         state['error'],
                 'block_minutes': c.get('block_minutes', 5),
-                'rule_name':    c.get('rule_name', ''),
+                'rule_name':     c.get('rule_name', ''),
             })
+
         elif self.path == '/api/rules':
-            # Helper: list all traffic rules so the user can find the right name
             try:
-                c      = cfg()
-                client = UniFiClient(c['controller_url'], c['username'],
-                                     c['password'], c.get('site', 'default'))
-                rules  = client.traffic_rules()
-                names  = [r.get('description', '?')
-                          for r in (rules if isinstance(rules, list)
-                                    else rules.get('data', []))]
-                self._json({'rules': names})
+                rules = _make_client().list_rules()
+                self._json({'rules': [r.get('description', '?') for r in rules]})
             except Exception as e:
                 self._json({'error': str(e)}, 502)
+
         else:
             self.send_error(404)
 
     def do_POST(self):
         if self.path == '/api/block':
             threading.Thread(target=block_tiktok, daemon=True).start()
-            time.sleep(0.3)   # let the thread start before responding
-            self._json({'ok': True})
+            time.sleep(0.5)
+            self._json({'ok': True, 'error': state.get('error')})
         elif self.path == '/api/unblock':
             threading.Thread(target=unblock_tiktok, daemon=True).start()
-            time.sleep(0.3)
+            time.sleep(0.5)
             self._json({'ok': True})
         else:
             self.send_error(404)
