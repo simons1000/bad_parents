@@ -6,8 +6,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=simon
-WorkingDirectory=/home/simon/bad_parents
-ExecStart=/usr/bin/python3 /home/simon/bad_parents/server.py
+WorkingDirectory=/home/simon/projects/bad_parents
+ExecStart=/usr/bin/python3 /home/simon/projects/bad_parents/server.py
 Restart=on-failure
 RestartSec=5
 
